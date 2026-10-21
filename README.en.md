@@ -2,13 +2,15 @@
 
 [简体中文](README.md) | **English**
 
-**Let your AI bring other models in to help.**
+**Let your main AI call affordable, fast open-source models just like subagents.**
 
 An MCP plugin for Claude Code, Codex, OpenCode, and other MCP-compatible tools.
 
 ## Why this exists
 
-Different models have different strengths. Getting another model to edit code, run tests, or check a page often means copying tasks and results between tools.
+DeepSeek V4.1 Flash is cheap enough and capable enough, but using it as a subagent inside Codex or Claude Code is still a hassle.
+
+This project offers an alternative to Luna and Haiku as execution subagents. With this MCP, you can hand development tasks to capable, fast open-source models just like you would to a subagent.
 
 agent_mcp keeps that collaboration in your current conversation. Your main agent delegates work, checks progress, and collects results. You can choose a model for each task and run multiple sessions at once.
 
