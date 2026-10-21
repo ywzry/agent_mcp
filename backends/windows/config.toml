@@ -1,0 +1,4 @@
+# Plugin-owned defaults. Do not discover the user's ~/.windows-mcp/config.toml.
+# Keep upstream desktop takeover protections enabled at their default settings.
+[server]
+transport = "stdio"

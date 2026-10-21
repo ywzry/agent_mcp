@@ -1,0 +1,19 @@
+# Only the release files below may be tracked.
+*
+!.gitignore
+!README.md
+!package.json
+!package-lock.json
+!tsconfig.json
+!src/
+!src/**/
+!src/**/*.ts
+!scripts/
+!scripts/setup-desktop.mjs
+!config/
+!config/example.yaml
+!backends/
+!backends/windows/
+!backends/windows/config.toml
+!backends/windows/requirements.in
+!backends/windows/requirements.lock

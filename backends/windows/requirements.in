@@ -1,0 +1,4 @@
+# Open-source Windows desktop backend, installed in a project-owned environment.
+windows-mcp==0.8.8
+# Upstream uv constraint; keep it explicit when installing the published wheel.
+pydantic-settings>=2.14.2

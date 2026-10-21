@@ -1,0 +1,34 @@
+# Copy to config/local.yaml and replace the provider/model settings.
+# Store the API key in MODEL_API_KEY; never put the key in this file.
+version: 1
+providers:
+  provider:
+    protocol: openai_chat_completions
+    base_url: https://api.example.com/v1
+    api_key_env: MODEL_API_KEY
+    # Optional gateway overrides:
+    # api_key_header: x-api-key
+    # api_key_prefix: ""
+models:
+  main:
+    provider: provider
+    model_id: YOUR_MODEL_ID
+    description: Main model; names and labels do not grant permissions
+    # Match the real model's capabilities and context limits.
+    capabilities: { tools: true, vision: false }
+    # Optional, only for providers that accept it: { effort: high }
+    reasoning: {}
+    context: { window_tokens: 128000, max_output_tokens: 8000, reserve_tokens: 2000 }
+    compaction: { enabled: true, trigger_ratio: 0.8, target_ratio: 0.5, preserve_recent_turns: 6 }
+defaults:
+  model: main
+  max_concurrent_runs: 2
+  run_timeout_ms: 300000
+  workspace: ../workspace
+  state_dir: ../.agent-mcp/state
+  max_steps: 24
+tools:
+  builtin: [read, edit, write, exec]
+  bundled: { browser: false, desktop: false }
+  mcp_servers: {}
+  skill_roots: []
