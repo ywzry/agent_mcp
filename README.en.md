@@ -72,6 +72,8 @@ Restart the MCP connection after changing the config. For screenshot understandi
 
 **Scope:** Live validation has focused on Windows. Window switching and resizing can still fail in some Windows apps. Run desktop tasks one at a time, and give each host a separate `state_dir` when using multiple hosts. Commands and desktop actions use your OS permissions; the workspace is not a security sandbox. Task content may be sent to your chosen model provider. Keep keys in environment variables and keep local configs and session data private.
 
+If you see `STOP_UNCONFIRMED`, that backend is quarantined while independent tools remain available. Confirm its outstanding work has stopped, shut down the plugin, remove the marker named in the error, then restart. Keep `state_dir` configured to preserve quarantine across restarts.
+
 ---
 
 Built with [MCP SDK](https://github.com/modelcontextprotocol/typescript-sdk) (Apache-2.0), [Google Chrome DevTools MCP](https://github.com/ChromeDevTools/chrome-devtools-mcp) (Apache-2.0), and [Windows-MCP](https://github.com/CursorTouch/Windows-MCP) (MIT).

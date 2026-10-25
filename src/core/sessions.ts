@@ -35,7 +35,7 @@ export interface Inspection {
   };
   artifacts: ArtifactRef[];
   persistence: string;
-  history?: Array<Message & { content_truncated?: boolean; images_omitted?: number }>;
+  history?: Array<Message & { content_truncated?: boolean; images_omitted?: number; provider_state_omitted?: boolean }>;
   history_truncated?: boolean;
 }
 
@@ -157,7 +157,12 @@ export class SessionManager {
       const capped = history.slice(-500);
       let truncated = history.length > capped.length;
       result.history = capped.map(message => {
-        const copy: Message & { content_truncated?: boolean; images_omitted?: number } = { ...message };
+        const copy: Message & { content_truncated?: boolean; images_omitted?: number; provider_state_omitted?: boolean } = { ...message };
+        if (copy.provider_state) {
+          delete copy.provider_state;
+          copy.provider_state_omitted = true;
+          truncated = true;
+        }
         if (copy.content.length > 8000) {
           copy.content = `${copy.content.slice(0, 8000)}\n[history content truncated; ${copy.content.length} characters total]`;
           copy.content_truncated = true;
@@ -177,7 +182,7 @@ export class SessionManager {
 
   list(offset = 0, limit = 100) {
     const description = this.runner.describe();
-    const all = [...this.states.values()].slice(-MAX_LIST_SESSIONS);
+    const all = [...this.states.values()];
     const safeLimit = Math.min(Math.max(1, limit), MAX_LIST_SESSIONS);
     const start = Math.min(Math.max(0, offset), all.length);
     const page = all.slice(start, start + safeLimit);
@@ -217,7 +222,7 @@ export class SessionManager {
       sessions,
       sessions_total: all.length,
       sessions_offset: start,
-      sessions_truncated: start + sessions.length < all.length || this.states.size > all.length,
+      sessions_truncated: start + sessions.length < all.length,
     };
   }
 
@@ -250,8 +255,8 @@ export class SessionManager {
     const truncated = slice.length < bytes.length;
     return {
       artifact: { ...ref },
-      encoding: ref.kind === 'image' ? 'base64' : 'utf8',
-      data: ref.kind === 'image' ? slice.toString('base64') : slice.toString('utf8'),
+      encoding: ref.kind === 'text' ? 'utf8' : 'base64',
+      data: ref.kind === 'text' ? slice.toString('utf8') : slice.toString('base64'),
       returned_bytes: slice.length,
       truncated,
     };
@@ -418,8 +423,9 @@ export class SessionManager {
       if (!this.hasAssistantMessage(state, run.id))
         this.appendInternal(state, run, { role: 'assistant', content: result.summary });
     } catch (error) {
-      run.status = timedOut ? 'failed' : controller.signal.aborted ? 'cancelled' : 'failed';
-      run.error = timedOut ? 'RUN_TIMEOUT'
+      const unconfirmed = error instanceof Error && 'code' in error && error.code === 'STOP_UNCONFIRMED';
+      run.status = unconfirmed || timedOut ? 'failed' : controller.signal.aborted ? 'cancelled' : 'failed';
+      run.error = unconfirmed ? error.message : timedOut ? 'RUN_TIMEOUT'
         : controller.signal.aborted ? (run.cancel_reason === 'shutdown' ? 'PLUGIN_SHUTDOWN' : 'CANCELLED')
           : error instanceof Error ? error.message : 'EXECUTOR_FAILED';
       if (controller.signal.aborted) run.cancel_reason ??= timedOut ? 'timeout' : 'user';
@@ -481,9 +487,10 @@ export class SessionManager {
       ...(input.name ? { name: input.name } : {}),
       ...(input.is_error ? { is_error: true } : {}),
       ...(input.images?.length ? { images: structuredClone(input.images) } : {}),
+      ...(input.provider_state ? { provider_state: structuredClone(input.provider_state) } : {}),
     };
     state.session.history.push(message);
-    return message;
+    return structuredClone(message);
   }
 
   private saveArtifactInternal(state: State, run: Run, input: ArtifactInput): ArtifactRef {

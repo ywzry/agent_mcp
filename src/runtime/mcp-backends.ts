@@ -1,19 +1,28 @@
-import { readFileSync, realpathSync, statSync } from 'node:fs';
-import { extname, isAbsolute, relative, resolve } from 'node:path';
+import { existsSync, mkdirSync, readFileSync, realpathSync, statSync, unlinkSync, writeFileSync } from 'node:fs';
+import { createHash } from 'node:crypto';
+import { extname, isAbsolute, join, relative, resolve } from 'node:path';
 import { Client } from '@modelcontextprotocol/client';
-import { getDefaultEnvironment, StdioClientTransport } from '@modelcontextprotocol/client/stdio';
+import { getDefaultEnvironment } from '@modelcontextprotocol/client/stdio';
 import { StreamableHTTPClientTransport } from '@modelcontextprotocol/client';
 import type { Config, McpServerConfig } from '../config.js';
 import type { ArtifactRef, MessageImage, RuntimeDescription } from '../core/types.js';
 import type { ModelTool } from './models.js';
 import type { DownstreamTools, ToolOutcome } from './tools.js';
+import { ownedStdio, type OwnedStdio } from './owned-stdio.js';
 
 interface LoadedServer {
   name: string;
   config: McpServerConfig;
   client: Client;
   tools: Map<string, { original: string; definition: ModelTool }>;
-  close: () => Promise<void>;
+  close: () => Promise<boolean>;
+}
+
+export class StopUnconfirmedError extends Error {
+  readonly code = 'STOP_UNCONFIRMED';
+  constructor(scope: string, marker?: string) {
+    super(`STOP_UNCONFIRMED: downstream resource ${scope} is quarantined. Confirm the remote operation and all owned processes have stopped before restarting${marker ? ` and deleting ${marker}` : ''}.`);
+  }
 }
 
 interface Route { server: string; original: string }
@@ -36,6 +45,11 @@ export class BackendManager {
   private status = new Map<string, RuntimeDescription['backends'][number]>();
   private locks = new Map<string, Mutex>();
   private closed = false;
+  private shutdown = new AbortController();
+  private quarantined = new Set<string>();
+  private inflight = new Map<string, number>();
+  private closing?: Promise<void>;
+  private retiring = new Map<Promise<boolean>, string>();
 
   constructor(private config: Config) {
     for (const [name, server] of Object.entries(config.tools.mcp_servers)) {
@@ -52,7 +66,6 @@ export class BackendManager {
       try {
         const server = await this.get(name, config, params);
         loaded.push(server);
-        for (const [namespaced, tool] of server.tools) routes.set(namespaced, { server: name, original: tool.original });
       } catch (error) {
         let message = error instanceof Error ? error.message : String(error);
         // A failing backend can echo authentication values into stderr or its
@@ -65,14 +78,27 @@ export class BackendManager {
           message = message.split(value).join('[REDACTED]');
         this.status.set(name, { name, transport: config.transport, connected: false, per_session: config.per_session, error: message });
         params.emit('mcp.connect_failed', `Downstream MCP ${name} is unavailable: ${message}`, { server: name });
+        if (params.signal.aborted || this.closed) {
+          const safe = new Error(message);
+          safe.name = error instanceof Error ? error.name : 'Error';
+          throw Object.assign(safe, { code: (error as { code?: string }).code });
+        }
       }
     }
     const definitions: ModelTool[] = [];
-    for (const server of loaded)
-      for (const [namespaced, tool] of server.tools) definitions.push({ ...tool.definition, name: namespaced });
+    for (const server of loaded) {
+      // A later failed connection may have quarantined an earlier one's group.
+      // Omit that entire scope; independent tools can still serve this run.
+      try { this.assertAvailable(this.scope(server.name, server.config)); }
+      catch (error) { if (error instanceof StopUnconfirmedError) continue; throw error; }
+      for (const [namespaced, tool] of server.tools) {
+        routes.set(namespaced, { server: server.name, original: tool.original });
+        definitions.push({ ...tool.definition, name: namespaced });
+      }
+    }
     return {
       definitions: () => definitions,
-      call: (name, args, signal) => this.call(routes, loaded, name, args, signal, params),
+      call: (name, args, signal) => this.call(routes, name, args, signal, params),
     };
   }
 
@@ -81,21 +107,40 @@ export class BackendManager {
   }
 
   async close(): Promise<void> {
+    return this.closing ??= this.closeAll();
+  }
+
+  private async closeAll(): Promise<void> {
     this.closed = true;
+    this.shutdown.abort();
     const values = [...this.loaded.values()];
     this.loaded.clear();
     await Promise.all(values.map(async promise => {
-      try { const server = await promise; await server.close(); } catch { /* failed connects own nothing */ }
+      try {
+        const server = await promise;
+        if (!await server.close() && (server.config.transport === 'stdio' || this.inflight.has(this.scope(server.name, server.config))))
+          this.quarantine(this.scope(server.name, server.config));
+      } catch { /* connect/call failure owns its quarantine */ }
     }));
+    await Promise.all([...this.retiring.keys()]);
   }
 
   private async get(name: string, config: McpServerConfig, params: ConnectParams): Promise<LoadedServer> {
+    const scope = this.scope(name, config);
+    // Connecting a replacement may itself have effects. All clients in this
+    // resource scope must wait for retirement, not only tools/call mutex owners.
+    for (;;) {
+      const pending = [...this.retiring].filter(([, resource]) => resource === scope).map(([promise]) => promise);
+      if (!pending.length) break;
+      await Promise.all(pending);
+    }
     if (this.closed) throw new Error('BACKEND_MANAGER_CLOSED');
+    this.assertAvailable(scope);
     const key = config.per_session ? `${name}::${params.sessionId}` : name;
     const existing = this.loaded.get(key);
     if (existing) return existing;
-    const promise = this.connect(name, config, params).catch(error => {
-      this.loaded.delete(key);
+    const promise = this.connect(name, config, { ...params, signal: AbortSignal.any([params.signal, this.shutdown.signal]) }).catch(error => {
+      if (this.loaded.get(key) === promise) this.loaded.delete(key);
       throw error;
     });
     this.loaded.set(key, promise);
@@ -106,6 +151,7 @@ export class BackendManager {
     params.signal.throwIfAborted();
     let stderr = '';
     let transport;
+    let owned: OwnedStdio | undefined;
     if (config.transport === 'stdio') {
       const env = { ...getDefaultEnvironment(), ...config.env };
       for (const [child, parent] of Object.entries(config.env_from)) {
@@ -113,7 +159,7 @@ export class BackendManager {
         if (!value) throw new Error(`BACKEND_ENV_MISSING: ${name} requires environment variable ${parent}`);
         env[child] = value;
       }
-      transport = new StdioClientTransport({
+      transport = owned = ownedStdio({
         command: config.command, args: config.args, env, cwd: config.cwd, stderr: 'pipe',
       });
       transport.stderr?.on('data', chunk => { stderr = (stderr + String(chunk)).slice(-8192); });
@@ -127,6 +173,23 @@ export class BackendManager {
       transport = new StreamableHTTPClientTransport(new URL(config.url), { requestInit: { headers } });
     }
     const client = new Client({ name: 'agent-mcp-downstream', version: '0.1.0' });
+    let stopping: Promise<boolean> | undefined;
+    const close = (): Promise<boolean> => {
+      if (stopping) return stopping;
+      stopping = (async () => {
+        // Keep ownership visible until cleanup and quarantine decisions finish.
+        const key = config.per_session ? `${name}::${params.sessionId}` : name;
+        const confirmed = owned ? await owned.stop().catch(() => false) : false;
+        try { await client.close(); } catch { /* local connection may already be gone */ }
+        this.status.set(name, { name, transport: config.transport, connected: false, per_session: config.per_session });
+        if (!confirmed && (owned || this.inflight.has(this.scope(name, config)))) this.quarantine(this.scope(name, config));
+        this.loaded.delete(key);
+        return confirmed;
+      })();
+      this.retiring.set(stopping, this.scope(name, config));
+      void stopping.finally(() => this.retiring.delete(stopping!)).catch(() => {});
+      return stopping;
+    };
     try {
       await withTimeout(
         client.connect(transport, { timeout: config.timeout_ms, signal: params.signal }),
@@ -150,39 +213,118 @@ export class BackendManager {
       params.emit('mcp.connected', `Connected to ${name} (${tools.size} tools).`, { server: name, tools: tools.size });
       return {
         name, config, client, tools,
-        close: async () => { try { await client.close(); } catch { /* transport already gone */ } },
+        close,
       };
     } catch (error) {
-      try { await client.close(); } catch { /* best effort */ }
+      const confirmed = await close();
       const detail = stderr ? `: ${stderr.slice(-2000)}` : '';
+      if (!confirmed && (owned || params.signal.aborted || /TIMEOUT|timed out/i.test(String(error)))) {
+        this.quarantine(this.scope(name, config));
+        const failure = new StopUnconfirmedError(this.scope(name, config), this.marker(this.scope(name, config)));
+        failure.message += detail;
+        throw failure;
+      }
       throw new Error(`${error instanceof Error ? error.message : String(error)}${detail}`);
     }
   }
 
   private async call(
-    routes: Map<string, Route>, loaded: LoadedServer[], name: string,
+    routes: Map<string, Route>, name: string,
     args: Record<string, unknown>, signal: AbortSignal, params: ConnectParams,
   ): Promise<ToolOutcome> {
     const route = routes.get(name);
     if (!route) throw new Error(`UNKNOWN_TOOL: ${name}`);
-    const server = loaded.find(item => item.name === route.server);
-    if (!server) throw new Error(`BACKEND_NOT_CONNECTED: ${route.server}`);
-    const lockKey = server.config.serial ? (server.config.exclusive_group ?? route.server) : undefined;
-    const release = lockKey ? await this.lock(lockKey, signal, params.emit) : undefined;
+    const config = this.config.tools.mcp_servers[route.server];
+    if (!config) throw new Error(`BACKEND_NOT_CONNECTED: ${route.server}`);
+    const scope = this.scope(route.server, config);
+    signal = AbortSignal.any([signal, this.shutdown.signal]);
+    this.assertAvailable(scope);
+    // A shared client always has one owner, even with serial=false. Independent
+    // per-session clients remain independent unless they share an exclusive group.
+    const instance = config.per_session ? `${route.server}::${params.sessionId}` : route.server;
+    const lockKey = config.serial || config.exclusive_group ? scope : `instance:${instance}`;
+    const release = await this.lock(lockKey, signal, params.emit);
     try {
+      this.assertAvailable(scope);
       if (signal.aborted) throw abortError();
+      const server = await this.get(route.server, config, { ...params, signal });
       params.emit('mcp.call.started', `Calling ${route.server}.${route.original}.`, { server: route.server, tool: route.original });
-      const result = await server.client.callTool(
-        { name: route.original, arguments: args },
-        { signal, timeout: server.config.timeout_ms, resetTimeoutOnProgress: true },
-      );
+      // A crash or failed stop leaves the marker in place. Reconnection is not
+      // evidence that an outstanding remote operation stopped.
+      this.writeMarker(scope);
+      let result: Awaited<ReturnType<Client['callTool']>>;
+      try {
+        result = await server.client.callTool(
+          { name: route.original, arguments: args },
+          { signal, timeout: server.config.timeout_ms, resetTimeoutOnProgress: true },
+        );
+        if (signal.aborted) throw abortError();
+        this.assertAvailable(scope);
+      } catch (error) {
+        const confirmed = await server.close();
+        if (!confirmed) {
+          this.quarantine(scope);
+          params.emit('mcp.stop_unconfirmed', `Downstream resource ${scope} quarantined.`, { scope });
+          throw new StopUnconfirmedError(scope, this.marker(scope));
+        }
+        this.clearMarker(scope);
+        throw error;
+      }
+      this.clearMarker(scope);
       params.emit('mcp.call.finished', `${route.server}.${route.original} returned${result.isError ? ' an error' : ''}.`, {
         server: route.server, tool: route.original, is_error: Boolean(result.isError),
       });
       return this.convert(route, result, args, params);
     } finally {
-      release?.();
+      release();
     }
+  }
+
+  private scope(name: string, config: McpServerConfig): string {
+    // Quarantine all sessions of a backend: a remote service may share resources
+    // even when its local client is per_session.
+    return config.exclusive_group ? `group:${config.exclusive_group}` : `backend:${name}`;
+  }
+
+  private marker(scope: string): string | undefined {
+    return this.config.defaults.state_dir ? join(this.config.defaults.state_dir, 'backend-quarantine', `${createHash('sha256').update(scope).digest('hex')}.json`) : undefined;
+  }
+
+  private assertAvailable(scope: string): void {
+    const marker = this.marker(scope);
+    if (this.quarantined.has(scope) || !this.inflight.has(scope) && marker && existsSync(marker)) throw new StopUnconfirmedError(scope, marker);
+  }
+
+  private writeMarker(scope: string): void {
+    const count = this.inflight.get(scope) ?? 0;
+    if (count) { this.inflight.set(scope, count + 1); return; }
+    const marker = this.marker(scope);
+    if (marker) {
+      mkdirSync(join(this.config.defaults.state_dir!, 'backend-quarantine'), { recursive: true });
+      writeFileSync(marker, JSON.stringify({ scope, created_at: new Date().toISOString(), reason: 'operation outstanding; stop not yet confirmed', recovery: 'Confirm all remote effects and owned processes stopped, shut down the plugin, then delete this marker.' }), { flag: 'wx' });
+    }
+    this.inflight.set(scope, 1);
+  }
+
+  private clearMarker(scope: string): void {
+    const count = this.inflight.get(scope) ?? 0;
+    if (count > 1) { this.inflight.set(scope, count - 1); return; }
+    this.inflight.delete(scope);
+    if (this.quarantined.has(scope)) return;
+    const marker = this.marker(scope);
+    if (marker && existsSync(marker)) unlinkSync(marker);
+  }
+
+  private quarantine(scope: string): void {
+    this.quarantined.add(scope);
+    const marker = this.marker(scope);
+    for (const [name, server] of Object.entries(this.config.tools.mcp_servers)) {
+      if (this.scope(name, server) === scope)
+        this.status.set(name, { name, transport: server.transport, connected: false, per_session: server.per_session,
+          error: new StopUnconfirmedError(scope, marker).message });
+    }
+    if (!marker || existsSync(marker)) return;
+    this.writeMarker(scope);
   }
 
   private convert(

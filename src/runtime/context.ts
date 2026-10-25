@@ -38,8 +38,14 @@ export function estimateMessages(messages: readonly Message[], summary?: string,
   let text = summary ? estimateText(summary) + 16 : 0;
   let images = 0;
   for (const message of messages) {
-    text += estimateText(message.content) + 6;
-    if (message.tool_calls) text += estimateText(JSON.stringify(message.tool_calls)) + 8;
+    const state = message.provider_state;
+    if (state && state.protocol !== 'openai_chat_completions') {
+      text += estimateText(JSON.stringify(state.protocol === 'anthropic' ? state.content : state.output)) + 6;
+    } else {
+      text += estimateText(message.content) + 6;
+      if (message.tool_calls) text += estimateText(JSON.stringify(message.tool_calls)) + 8;
+      if (state?.protocol === 'openai_chat_completions') text += estimateText(state.reasoning_content);
+    }
     for (const image of message.images ?? []) images += Math.ceil((image.data.length * 0.75) / 750);
   }
   return {

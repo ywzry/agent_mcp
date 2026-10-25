@@ -15,6 +15,12 @@ export interface MessageImage {
   data: string;
 }
 
+/** Opaque provider continuation data, persisted but not exposed by inspect. */
+export type ProviderState =
+  | { protocol: 'openai_chat_completions'; reasoning_content: string }
+  | { protocol: 'openai_responses'; output: Record<string, unknown>[] }
+  | { protocol: 'anthropic'; content: Record<string, unknown>[] };
+
 /**
  * Provider-neutral conversation record. Tool calls and tool results are stored
  * as separate messages so they can always be persisted and replayed as a pair.
@@ -30,6 +36,7 @@ export interface Message {
   name?: string;
   is_error?: boolean;
   images?: MessageImage[];
+  provider_state?: ProviderState;
 }
 
 export interface MessageInput {
@@ -40,6 +47,7 @@ export interface MessageInput {
   name?: string;
   is_error?: boolean;
   images?: MessageImage[];
+  provider_state?: ProviderState;
 }
 
 export interface Usage {
@@ -180,7 +188,7 @@ export interface RunContext {
   workspace: string;
   signal: AbortSignal;
   emit: (type: string, message: string, data?: unknown) => void;
-  /** Append a message to the raw persisted session history. Returns the stored record. */
+  /** Append to the raw archive. Returns an independent working copy. */
   append: (message: MessageInput) => Message;
   /** Consume pending user inputs. Safe boundary: after complete tool results. */
   takeInputs: () => ConsumedInput[];

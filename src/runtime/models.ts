@@ -1,5 +1,5 @@
 import type { ModelConfig, ProviderConfig } from '../config.js';
-import type { Message, SessionSettings, ToolCall, Usage } from '../core/types.js';
+import type { Message, ProviderState, SessionSettings, ToolCall, Usage } from '../core/types.js';
 import { usageFrom } from './context.js';
 
 export interface ModelTool {
@@ -21,6 +21,7 @@ export interface ModelRequest {
 export interface ModelResponse {
   text: string;
   tool_calls: ToolCall[];
+  provider_state?: ProviderState;
   usage: Usage;
   finish_reason?: string;
 }
@@ -38,6 +39,10 @@ export class HttpModelClient implements ModelClient {
   async request(request: ModelRequest): Promise<ModelResponse> {
     const { provider } = request;
     if (provider.protocol === 'demo') throw new ModelError('DEMO_PROVIDER', 'demo providers are handled by the demo runner');
+    for (const message of request.messages) {
+      if (message.provider_state && message.provider_state.protocol !== provider.protocol)
+        throw new ModelError('PROVIDER_STATE_PROTOCOL_MISMATCH', `cannot replay ${message.provider_state.protocol} state with ${provider.protocol}`);
+    }
     const key = this.apiKey(provider);
     if (request.tools.length && !request.model.capabilities.tools)
       throw new ModelError('MODEL_TOOLS_UNSUPPORTED', 'model capability tools=false but tools are configured');
@@ -65,6 +70,8 @@ export class HttpModelClient implements ModelClient {
         messages.push({
           role: 'assistant',
           content: message.content || null,
+          ...(message.provider_state?.protocol === 'openai_chat_completions'
+            ? { reasoning_content: message.provider_state.reasoning_content } : {}),
           ...(message.tool_calls?.length ? {
             tool_calls: message.tool_calls.map(call => ({
               id: call.id, type: 'function',
@@ -101,6 +108,9 @@ export class HttpModelClient implements ModelClient {
       throw new ModelError('MODEL_RESPONSE_INVALID', `no text or tool calls (finish_reason=${String(choice.finish_reason)})`);
     return {
       text, tool_calls: calls,
+      ...(typeof message.reasoning_content === 'string' ? {
+        provider_state: { protocol: 'openai_chat_completions' as const, reasoning_content: message.reasoning_content },
+      } : {}),
       usage: openAiUsage(data.usage, 'openai_chat_completions'),
       finish_reason: typeof choice.finish_reason === 'string' ? choice.finish_reason : undefined,
     };
@@ -110,9 +120,15 @@ export class HttpModelClient implements ModelClient {
     const input: unknown[] = [];
     for (const message of request.messages) {
       if (message.role === 'assistant') {
-        if (message.content.trim()) input.push({ role: 'assistant', content: message.content });
-        for (const call of message.tool_calls ?? [])
-          input.push({ type: 'function_call', call_id: call.id, name: call.name, arguments: JSON.stringify(call.arguments ?? {}) });
+        if (message.provider_state?.protocol === 'openai_responses') {
+          // These ordered items are the continuation, including opaque reasoning.
+          // Rebuilding text/calls as well would duplicate the assistant's output.
+          input.push(...message.provider_state.output);
+        } else {
+          if (message.content.trim()) input.push({ role: 'assistant', content: message.content });
+          for (const call of message.tool_calls ?? [])
+            input.push({ type: 'function_call', call_id: call.id, name: call.name, arguments: JSON.stringify(call.arguments ?? {}) });
+        }
       } else if (message.role === 'tool') {
         input.push({ type: 'function_call_output', call_id: message.tool_call_id, output: message.content });
       } else if (message.images?.length) {
@@ -133,6 +149,8 @@ export class HttpModelClient implements ModelClient {
       model: request.model.model_id,
       instructions: request.system,
       input,
+      store: false,
+      include: ['reasoning.encrypted_content'],
       max_output_tokens: request.settings.max_output_tokens ?? request.model.context.max_output_tokens,
     };
     if (request.settings.reasoning_effort !== undefined)
@@ -148,7 +166,8 @@ export class HttpModelClient implements ModelClient {
     if (data.error) throw new ModelError('MODEL_RESPONSE_INVALID', safeText(JSON.stringify(data.error), key));
     let text = '';
     const calls: ToolCall[] = [];
-    for (const item of asArray(data.output)) {
+    const output = data.output === undefined ? undefined : providerItems(data.output, 'output');
+    for (const item of output ?? []) {
       const value = asRecord(item);
       if (value.type === 'function_call') {
         const id = typeof value.call_id === 'string' ? value.call_id : value.id;
@@ -167,6 +186,7 @@ export class HttpModelClient implements ModelClient {
       throw new ModelError('MODEL_RESPONSE_INVALID', `no text or tool calls (${String(data.status ?? 'unknown')})`);
     return {
       text, tool_calls: calls, usage: openAiUsage(data.usage, 'openai_responses'),
+      ...(output?.length ? { provider_state: { protocol: 'openai_responses' as const, output } } : {}),
       finish_reason: typeof data.status === 'string' ? data.status : undefined,
     };
   }
@@ -195,7 +215,8 @@ export class HttpModelClient implements ModelClient {
     const data = await this.post(url, key, request, body, { 'anthropic-version': '2023-06-01' });
     let text = '';
     const calls: ToolCall[] = [];
-    for (const block of asArray(data.content)) {
+    const content = providerItems(data.content, 'content');
+    for (const block of content) {
       const value = asRecord(block);
       if (value.type === 'text' && typeof value.text === 'string') text += value.text;
       else if (value.type === 'tool_use' && typeof value.id === 'string' && typeof value.name === 'string')
@@ -205,6 +226,7 @@ export class HttpModelClient implements ModelClient {
       throw new ModelError('MODEL_RESPONSE_INVALID', `no text or tool calls (${String(data.stop_reason ?? 'unknown')})`);
     return {
       text, tool_calls: calls, usage: anthropicUsage(data.usage),
+      provider_state: { protocol: 'anthropic', content },
       finish_reason: typeof data.stop_reason === 'string' ? data.stop_reason : undefined,
     };
   }
@@ -308,6 +330,10 @@ function anthropicMessages(messages: readonly Message[]): unknown[] {
         content: message.content || '(empty)', ...(message.is_error ? { is_error: true } : {}),
       }]);
     } else if (message.role === 'assistant') {
+      if (message.provider_state?.protocol === 'anthropic') {
+        push('assistant', message.provider_state.content);
+        continue;
+      }
       const content: unknown[] = [];
       if (message.content) content.push({ type: 'text', text: message.content });
       for (const call of message.tool_calls ?? [])
@@ -346,6 +372,11 @@ function asRecord(value: unknown): Record<string, unknown> {
   return value && typeof value === 'object' && !Array.isArray(value) ? value as Record<string, unknown> : {};
 }
 function asArray(value: unknown): unknown[] { return Array.isArray(value) ? value : []; }
+function providerItems(value: unknown, field: string): Record<string, unknown>[] {
+  if (!Array.isArray(value) || value.some(item => !item || typeof item !== 'object' || Array.isArray(item)))
+    throw new ModelError('MODEL_RESPONSE_INVALID', `${field} must be an array of objects`);
+  return value as Record<string, unknown>[];
+}
 function safeText(value: string, key: string): string {
   const redacted = key ? value.split(key).join('[redacted]') : value;
   return redacted.slice(0, 4000);

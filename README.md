@@ -72,6 +72,8 @@ export MODEL_API_KEY="YOUR_API_KEY"
 
 **使用范围：** 当前实机验证以 Windows 为主；部分 Windows 应用的窗口切换、重排仍可能失败。桌面任务请顺序执行；多个宿主同时使用时，各自配置不同的 `state_dir`。命令和桌面操作使用本机权限，工作区不是安全沙箱；任务内容可能发送给所选模型厂商。密钥放环境变量，本地配置和会话数据请保持私有。
 
+若出现 `STOP_UNCONFIRMED`，该后端会被隔离，其它独立工具仍可用。确认后台动作已停后，关闭插件、删除错误提示指向的隔离标记，再启动。保留 `state_dir` 才能让隔离跨重启生效。
+
 ---
 
 感谢 [MCP SDK](https://github.com/modelcontextprotocol/typescript-sdk)（Apache-2.0）、[Google Chrome DevTools MCP](https://github.com/ChromeDevTools/chrome-devtools-mcp)（Apache-2.0）和 [Windows-MCP](https://github.com/CursorTouch/Windows-MCP)（MIT）。

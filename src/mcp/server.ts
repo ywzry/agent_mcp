@@ -30,7 +30,7 @@ export function createServer(manager: SessionManager) {
     inputSchema: z.object({ task, model: z.string().min(1).optional().describe('Configured model alias; defaults to config'), name: name.optional(), tags: tags.optional(), ...settings }).strict(),
   }, input => response(() => manager.start(input)));
   server.registerTool('agent_inspect', {
-    description: 'Without session_id list sessions/models/credentials/backends. With session_id return run state, result, artifacts, context counts and up to 100 events after cursor. Read artifact content with artifact_id. include_history returns the raw persisted record (capped).',
+    description: 'Without session_id list sessions/models/credentials/backends. With session_id return run state, result, artifacts, context counts and up to 100 events after cursor. Read artifacts by artifact_id: text is UTF-8, other bytes are Base64. include_history returns bounded history with opaque provider continuation data omitted.',
     inputSchema: z.object({
       session_id: id.optional(),
       run_id: id.optional(),
@@ -57,7 +57,7 @@ export function createServer(manager: SessionManager) {
     inputSchema: z.object({ session_id: id, task: task.optional(), name: name.optional(), tags: tags.optional() }).strict(),
   }, input => response(() => manager.send(input)));
   server.registerTool('agent_cancel', {
-    description: 'Cancel the specified current run. The run stays cancelling until the executor, shell process tree and downstream calls actually stop; inspect for confirmation. Later cancel requests for a terminal run do not change its result.',
+    description: 'Request cancellation of the current run, then inspect the final state. Owned downstream process cleanup is verified before resource reuse. STOP_UNCONFIRMED means cleanup could not be confirmed: the run fails and the downstream resource is quarantined. Cancelling a terminal run does not change its result.',
     inputSchema: z.object({ session_id: id, run_id: id }).strict(),
     annotations: { idempotentHint: true },
   }, input => response(() => manager.cancel(input.session_id, input.run_id)));
